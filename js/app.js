@@ -1,7 +1,8 @@
 import { CASES, getCase, nextCaseId, randomCaseId } from "./cases.js";
 import { CAUSES } from "./causes.js";
 import { DOSE_NOTE, MOVES, RHYTHMS, activeNodes, drugPlan, predictionCorrect } from "./explore-model.js";
-import { act, actionsFor, formatClock, pocket, readout, startCase } from "./engine.js";
+import { act, etco2, formatClock, readout, startCase } from "./engine.js";
+import { SKIP_ACTIONS, STAGES, currentCard, drawerModel, splitScreen, stageLog, stageStatus, stageVerdict } from "./guide.js";
 import { mountTrace, rhythmMeta } from "./rhythm.js";
 import { clearRecord, loadRecord, saveResult, shiftStats } from "./store.js";
 
@@ -11,7 +12,9 @@ const SOURCE = "Resuscitation Council UK 2025 Adult ALS algorithm.";
 let record = loadRecord();
 let route = { view: "cases" };
 let caseState = null;
+let guide = null;
 let traceCtl = null;
+let dwellTimer = 0;
 let playTimer = 0;
 let explore = {
   rhythm: "vf",
@@ -98,12 +101,52 @@ function stopPlay() {
   playTimer = 0;
 }
 
+function freshGuide() {
+  return { limb: null, seenFindings: 0, review: null, drawer: false, dwellAt: 0, dwellPhase: "", nudged: "", cardId: "", skipAirway: false, skipCapno: false, stamps: {} };
+}
+
+function skipPref() {
+  try { return localStorage.getItem("als-skip-intro") === "1"; } catch { return false; }
+}
+
+function beginCase(id) {
+  caseState = startCase(id);
+  guide = freshGuide();
+  if (skipPref()) {
+    for (const step of SKIP_ACTIONS) caseState = act(caseState, step);
+    noteStamps();
+  }
+}
+
+function noteStamps() {
+  if (!guide || !caseState) return;
+  const flags = {
+    recognise: caseState.safety,
+    help: caseState.help,
+    cpr: caseState.cprEver,
+    defib: caseState.defib,
+    rhythm: caseState.assessCount > 0,
+    treat: !!(caseState.access || caseState.adrenalineAt.length || caseState.amio || Object.keys(caseState.treatMarks).length),
+    rosc: caseState.hadRosc || caseState.confirmedRosc,
+  };
+  for (const [id, ok] of Object.entries(flags)) {
+    if (ok && guide.stamps[id] == null) guide.stamps[id] = caseState.t;
+  }
+}
+
 function paint() {
   const main = document.getElementById("main");
   chrome();
+  document.body.classList.toggle("is-guided", route.view === "case");
+  if (route.view !== "case") {
+    clearInterval(dwellTimer);
+    dwellTimer = 0;
+  }
   if (route.view === "case") renderCase(main);
   else if (route.view === "explore") renderExplore(main);
   else {
+    clearInterval(dwellTimer);
+    dwellTimer = 0;
     stopTrace();
     stopPlay();
     main.dataset.view = route.view;
@@ -143,8 +186,9 @@ function casesView() {
       <section class="card">
         <p class="kicker">Cases</p>
         <h2>Run the arrest.</h2>
-        <p class="small">Ten patients. The cause is hidden until the debrief.</p>
-        <button type="button" class="primary" data-act="random" style="margin-bottom:10px">Random case</button>
+        <p class="small">Ten patients. The cause is hidden until the debrief. Each case is one step at a time until the defibrillator is on.</p>
+        <label class="skip-pref"><input type="checkbox" data-act="skip-pref" ${skipPref() ? "checked" : ""}> Experienced: start with the defibrillator on</label>
+        <button type="button" class="primary" data-act="random" style="margin:10px 0">Random case</button>
         <div class="case-list">${rows}</div>
       </section>
       <section class="card">
@@ -156,29 +200,52 @@ function casesView() {
 }
 
 function renderCase(main) {
-  if (!caseState) return;
+  if (!caseState || !guide) return;
   if (main.dataset.view !== "case") {
     stopTrace();
     stopPlay();
     main.dataset.view = "case";
-    main.innerHTML = `<div class="case-layout">
-      <section id="case-head" class="card"></section>
-      <section class="card monitor-card">
-        <div class="monitor-top"><span class="kicker" id="mon-name">Monitor</span><span class="mono" id="mon-hr"></span></div>
-        <canvas id="trace" role="img" aria-label="Defibrillator monitor"></canvas>
-        <p id="mon-cap" class="caption"></p>
-        <div id="cycle-bar" class="cycle-bar" hidden><span id="cycle-fill"></span></div>
-      </section>
-      <aside id="case-side" class="case-side"></aside>
-      <div id="case-under" class="case-under under-stack"></div>
+    main.innerHTML = `<div class="guide">
+      <div class="rail-bar">
+        <div class="rail" id="rail" role="tablist" aria-label="Arrest stages"></div>
+        <div class="rail-end">
+          <span class="mono rail-clock" id="rail-clock">0:00</span>
+          <button type="button" class="texty" data-act="theme">Dark</button>
+          <a class="texty" href="#cases">Exit</a>
+        </div>
+      </div>
+      <p id="guide-crit" class="banner-crit" hidden></p>
+      <div class="guide-body" id="guide-body">
+        <section class="monitor-dock" id="monitor-dock" hidden>
+          <div class="dock-top">
+            <span class="kicker" id="mon-name">Monitor</span>
+            <span class="mono" id="mon-hr"></span>
+          </div>
+          <canvas id="trace" role="img" aria-label="Defibrillator monitor"></canvas>
+          <p id="mon-cap" class="dock-cap"></p>
+          <div class="dock-stats">
+            <div class="ring-wrap" id="cycle-ring" aria-label="CPR cycle"></div>
+            <div><span class="kicker">Cycle</span><strong class="mono" id="stat-cycle">—</strong></div>
+            <div><span class="kicker">Shocks</span><strong class="mono" id="stat-shocks">0</strong></div>
+            <div><span class="kicker">Since adrenaline</span><strong class="mono" id="stat-adr">—</strong></div>
+            <div id="stat-etco2-wrap" hidden><span class="kicker">EtCO2</span><strong class="mono" id="stat-etco2">—</strong></div>
+          </div>
+        </section>
+        <section class="step-pane" id="step-pane"></section>
+      </div>
+      <button type="button" class="drawer-tab" id="drawer-tab" hidden data-act="drawer">4Hs · 4Ts</button>
+      <div class="sheet" id="sheet" hidden>
+        <div class="sheet-grab" data-act="close-drawer" role="button" tabindex="0" aria-label="Close the reversible causes"></div>
+        <div id="sheet-body"></div>
+      </div>
     </div>`;
-    traceCtl = mountTrace(document.getElementById("trace"), () => traceSpec());
   }
   if (caseState.ended && !caseState._saved) {
     caseState._saved = true;
     record = saveResult(caseState);
   }
-  fillCase();
+  noteStamps();
+  fillGuide();
 }
 
 function traceSpec() {
@@ -187,81 +254,129 @@ function traceSpec() {
   return { rhythm: view.rhythm, style: view.style, rate: view.rate };
 }
 
-function fillCase() {
+function ensureTrace() {
+  const canvas = document.getElementById("trace");
+  if (canvas && !traceCtl) traceCtl = mountTrace(canvas, () => traceSpec());
+}
+
+function fillGuide() {
   const s = caseState;
-  const c = getCase(s.caseId);
+  const status = stageStatus(s);
+  const split = splitScreen(s);
+  document.getElementById("rail").innerHTML = STAGES.map((stage) => {
+    const state = stage.id === status.current ? "current" : status.done[stage.id] ? "done" : "wait";
+    const stamp = guide.stamps[stage.id];
+    const locked = !s.ended && state === "wait";
+    return `<button type="button" class="chip ${state}" data-stage="${stage.id}" ${locked ? "disabled" : ""} aria-current="${state === "current" ? "step" : "false"}">
+      <span class="chip-label">${esc(stage.short)}</span>
+      <span class="mono chip-time">${stamp == null ? "" : esc(formatClock(stamp))}</span>
+    </button>`;
+  }).join("");
+  document.getElementById("rail-clock").textContent = formatClock(s.t);
+  const theme = document.querySelector(".rail-end [data-act=theme]");
+  if (theme) theme.textContent = themeNow() === "dark" ? "Light" : "Dark";
+
+  const crit = document.getElementById("guide-crit");
+  if (s.criticals.length && !s.ended) {
+    crit.hidden = false;
+    crit.textContent = "Critical error recorded. The score is a fail. Carry on for the debrief.";
+  } else crit.hidden = true;
+
+  const body = document.getElementById("guide-body");
+  body.classList.toggle("split", split);
+  const dock = document.getElementById("monitor-dock");
+  dock.hidden = !split;
+  const tab = document.getElementById("drawer-tab");
+  const showDrawerTab = split && !s.ended && s.phase === "cpr";
+  tab.hidden = !showDrawerTab;
+  if (split) {
+    ensureTrace();
+    paintMonitor(s);
+  }
+  const sheet = document.getElementById("sheet");
+  sheet.hidden = !(guide.drawer && showDrawerTab);
+  if (!sheet.hidden) document.getElementById("sheet-body").innerHTML = drawerHtml(s);
+
+  const pane = document.getElementById("step-pane");
+  const html = s.ended ? debriefHtml(s) : stepHtml(s);
+  const nextId = s.ended ? `debrief-${guide.review || status.current}` : (guide.review ? `review-${guide.review}` : currentCard(s, guide)?.id);
+  const entering = pane.dataset.card !== nextId;
+  pane.dataset.card = nextId || "";
+  pane.innerHTML = html;
+  if (entering) pane.querySelector(".step-card")?.classList.add("is-enter");
+  if (entering) maybeNudge(s);
+  armDwell(s);
+}
+
+function paintMonitor(s) {
   const view = readout(s);
   const meta = rhythmMeta(view.rhythm, view.style);
-  const head = document.getElementById("case-head");
-  const flash = s.flash ? `<div class="flash ${esc(s.flash.kind)}" role="status">${esc(s.flash.text)}</div>` : "";
-  const crit = s.criticals.length && !s.ended
-    ? `<div class="banner-crit">Critical error recorded. The score is a fail. Carry on if you want the debrief to show the rest.</div>`
-    : "";
-  head.innerHTML = `
-    <div class="identity">
-      <div class="clock"><strong>${esc(view.clock)}</strong><span>since collapse</span></div>
-      <div>
-        <p class="kicker">${esc(c.setting)}</p>
-        <h1>${esc(c.title)}</h1>
-        <p class="small" style="margin:0">${esc(c.complaint)}</p>
-      </div>
-    </div>
-    <ul class="vitals">${view.vitals.map((v) => `<li>${esc(v)}</li>`).join("")}
-      <li>${s.defib ? esc(view.pads) + " pads" : "Defib not attached"}</li>
-      <li>Shocks ${s.shocks}</li>
-      <li>${s.cprOn ? "CPR on" : "CPR off"}</li>
-      <li>${s.airway ? (s.airway === "sga" ? "SGA · continuous" : "Tube · continuous") : "CPR 30:2"}</li>
-    </ul>
-    ${flash}${crit}`;
-
-  document.getElementById("mon-name").textContent = s.defib ? meta.name : "No trace";
-  document.getElementById("mon-hr").textContent = s.defib ? meta.hr : "";
-  const cap = document.getElementById("mon-cap");
-  cap.textContent = s.defib ? `${meta.detail} · ${meta.limb}` : "Attach the defibrillator to see the rhythm.";
-  document.getElementById("trace").setAttribute("aria-label", s.defib ? `Monitor showing ${meta.detail}` : "Monitor blank, defibrillator not attached");
-  const bar = document.getElementById("cycle-bar");
-  if (view.cycleRemain == null) bar.hidden = true;
-  else {
-    bar.hidden = false;
-    document.getElementById("cycle-fill").style.width = `${Math.min(100, ((120 - view.cycleRemain) / 120) * 100)}%`;
-  }
-
-  document.getElementById("case-side").innerHTML = s.ended ? debriefCard(s, c) : actionsCard(s);
-  document.getElementById("case-under").innerHTML = underCards(s);
+  document.getElementById("mon-name").textContent = meta.name;
+  document.getElementById("mon-hr").textContent = meta.hr === "—" ? "" : meta.hr;
+  document.getElementById("mon-cap").textContent = meta.detail;
+  document.getElementById("trace")?.setAttribute("aria-label", `Monitor showing ${meta.detail}`);
+  const remain = view.cycleRemain;
+  const progress = remain == null ? 0 : Math.min(1, Math.max(0, (120 - remain) / 120));
+  const circ = 97.4;
+  document.getElementById("cycle-ring").innerHTML = `<svg viewBox="0 0 36 36" aria-hidden="true">
+      <circle class="ring-bg" cx="18" cy="18" r="15.5"></circle>
+      <circle class="ring-fg" cx="18" cy="18" r="15.5" stroke-dasharray="${circ}" stroke-dashoffset="${(circ * (1 - progress)).toFixed(2)}"></circle>
+    </svg><span class="mono">${remain == null ? "—" : formatClock(remain)}</span>`;
+  document.getElementById("stat-cycle").textContent = s.cycleIndex ? String(s.cycleIndex) : "—";
+  document.getElementById("stat-shocks").textContent = String(s.shocks);
+  const age = s.adrenalineAt.length ? formatClock(s.t - s.adrenalineAt[s.adrenalineAt.length - 1]) : "—";
+  document.getElementById("stat-adr").textContent = age;
+  const co2 = etco2(s);
+  const wrap = document.getElementById("stat-etco2-wrap");
+  wrap.hidden = !co2;
+  if (co2) document.getElementById("stat-etco2").textContent = co2;
 }
 
-function actionsCard(s) {
-  const groups = actionsFor(s).map((group) => {
-    const body = group.compact ? `<div class="cause-grid">${group.rows.map((row) => actionButton(s, row)).join("")}</div>` : group.rows.map((row) => actionButton(s, row)).join("");
-    return `<p class="group-label">${esc(group.title)}</p>${body}`;
+function stepHtml(s) {
+  if (guide.review) return reviewHtml(s, guide.review, false);
+  const card = currentCard(s, guide);
+  if (!card) return "";
+  const dwell = `<p id="dwell" class="dwell" hidden>Minimise the interruption. Deliver the shock, or restart CPR.</p>`;
+  const flash = s.flash ? `<p class="flash ${esc(s.flash.kind)}" role="status">${esc(s.flash.text)}</p>` : "";
+  const targets = card.targets.map((target) => {
+    const extra = target.item ? ` data-item="${esc(target.item)}"` : target.cause ? ` data-cause="${esc(target.cause)}"` : "";
+    return `<button type="button" class="tap ${esc(target.tone || "ghost")}" data-act="${esc(target.act)}"${extra}>${esc(target.label)}</button>`;
   }).join("");
-  return `<div class="side-stack">
-    <section class="card"><p class="pocket">${esc(pocket(s))}</p></section>
-    <section class="card">
-      <div class="card-top"><p class="kicker" style="margin:0">Actions</p><span class="mono">${esc(formatClock(s.t))}</span></div>
-      ${groups}
-    </section>
-  </div>`;
+  return `<article class="step-card${card.nudge ? " nudge" : ""}" data-step="${esc(card.id)}">
+    <p class="kicker">${esc(card.kicker)}</p>
+    <h2>${esc(card.title)}</h2>
+    <p class="step-body">${esc(card.body)}</p>
+    ${flash}
+    ${dwell}
+    <div class="taps">${targets}</div>
+  </article>`;
 }
 
-function actionButton(s, row) {
-  const shockHot = row.tone === "shock" || (row.type === "shock" && s.phase === "decision" && (s.rhythm === "vf" || s.rhythm === "pvt"));
-  const cls = ["action", shockHot ? "shock" : "", row.tone === "primary" || row.type === "end" ? "primary" : ""].filter(Boolean).join(" ");
-  const extra = row.extra ? Object.entries(row.extra).map(([k, v]) => `data-${k}="${esc(v)}"`).join(" ") : "";
-  const cost = row.type === "end" ? "score" : row.cost ? `+${row.cost}s` : "";
-  return `<button type="button" class="${cls}" data-act="${esc(row.type)}" ${extra} ${row.enabled ? "" : "disabled"}>
-    <span><strong>${esc(row.label)}</strong>${row.hint ? `<small>${esc(row.hint)}</small>` : ""}</span>
-    <span class="cost mono">${esc(cost)}</span>
-  </button>`;
+function reviewHtml(s, stageId, debrief) {
+  const stage = STAGES.find((item) => item.id === stageId) || STAGES[0];
+  const verdict = stageVerdict(s, stageId);
+  const lines = stageLog(s, stageId, guide.stamps);
+  const list = lines.length
+    ? `<ol class="timeline">${lines.map((line) => `<li><span class="when mono">${esc(formatClock(line.t))}</span><span class="${esc(line.tone)}">${esc(line.text)}</span></li>`).join("")}</ol>`
+    : `<p class="small">Nothing recorded on this stage.</p>`;
+  return `<article class="step-card review-card">
+    <p class="kicker">${debrief ? "Debrief" : "Read only"} · ${esc(stage.label)}</p>
+    <h2>${esc(stage.label)}${guide.stamps[stageId] != null ? ` · ${esc(formatClock(guide.stamps[stageId]))}` : ""}</h2>
+    <p class="expect"><span class="mark ${verdict.ok ? "ok" : "no"}">${verdict.ok ? "Met" : "Not met"}</span> ${esc(verdict.expected)}</p>
+    ${list}
+    ${debrief ? "" : `<button type="button" class="tap ghost" data-act="close-review">Back to the step</button>`}
+  </article>`;
 }
 
-function debriefCard(s, c) {
+function debriefHtml(s) {
+  const c = getCase(s.caseId);
   const best = record.cases[c.id];
+  const focus = guide.review || stageStatus(s).current;
   const deductions = [
     ...s.criticals.map((item) => `<li><strong>Fail.</strong> ${esc(item.text)}</li>`),
     ...s.penalties.map((item) => `<li><span class="mono">−${item.points}</span> ${esc(item.text)}</li>`),
   ].join("");
-  return `<div class="side-stack">
+  return `<div class="debrief-grid">
     <section class="card debrief">
       <p class="kicker">Debrief</p>
       <h2>${esc(s.headline)}</h2>
@@ -272,10 +387,11 @@ function debriefCard(s, c) {
       <p class="small">Best on this device: ${best ? best.best : s.score}. ${esc(DISCLAIMER)}</p>
       <div class="btn-row">
         <button type="button" class="primary" data-act="next">Next case</button>
-        <a class="ghost" href="#explore" style="display:inline-block">Open explore</a>
+        <a class="ghost" href="#explore">Open explore</a>
         <a class="texty" href="#cases">All cases</a>
       </div>
     </section>
+    ${reviewHtml(s, focus, true)}
     <section class="card">
       <p class="kicker">From this case</p>
       <ul class="deductions">${c.learn.map((line) => `<li>${esc(line)}</li>`).join("")}</ul>
@@ -283,14 +399,63 @@ function debriefCard(s, c) {
   </div>`;
 }
 
-function underCards(s) {
-  const findings = s.findings.map((f) => `<section class="card"><p class="kicker">${esc(f.title)} · ${esc(formatClock(f.t))}</p><p style="margin:0">${esc(f.text)}</p></section>`).join("");
-  const timeline = `<section class="card"><p class="kicker">Timeline</p><ol class="timeline">${s.log.map((line) => `<li><span class="when mono">${esc(formatClock(line.t))}</span><span class="${esc(line.tone)}">${esc(line.text)}</span></li>`).join("")}</ol></section>`;
-  const check = s.ended
-    ? `<section class="card"><p class="kicker">Against the algorithm</p><ul class="check">${s.checklist.map((row) => `<li><span>${esc(row.label)}</span><span class="mark ${row.ok ? "ok" : "no"}">${row.ok ? "Met" : "Miss"}</span></li>`).join("")}</ul></section>`
-    : "";
-  return findings + timeline + check;
+function drawerHtml(s) {
+  const model = drawerModel(s);
+  const button = (item) => {
+    const extra = item.id ? ` data-cause="${esc(item.id)}"` : "";
+    return `<button type="button" class="action" data-act="${esc(item.act)}"${extra} ${item.done ? "disabled" : ""}><strong>${esc(item.label)}</strong>${item.done ? "<small>Done</small>" : ""}</button>`;
+  };
+  const flash = s.flash ? `<p class="flash ${esc(s.flash.kind)}">${esc(s.flash.text)}</p>` : "";
+  return `${flash}
+    <p class="kicker">Look</p>
+    ${model.look.map(button).join("")}
+    <p class="kicker">Consider</p>
+    ${model.consider.map(button).join("")}
+    <p class="kicker">Drugs, if you already have access</p>
+    ${model.drugs.map(button).join("")}
+    <p class="kicker">4Hs and 4Ts</p>
+    <div class="cause-grid">${model.causes.map(button).join("")}</div>
+    <button type="button" class="tap ghost" data-act="close-drawer">Close</button>`;
 }
+
+function maybeNudge(s) {
+  const card = s.ended ? null : currentCard(s, guide);
+  if (!card?.nudge) return;
+  const key = card.id;
+  if (guide.nudged === key) return;
+  guide.nudged = key;
+  try { navigator.vibrate?.(18); } catch { /* optional */ }
+}
+
+function armDwell(s) {
+  const watching = s && !s.ended && (s.phase === "decision" || s.phase === "postshock");
+  if (!watching) {
+    guide.dwellAt = 0;
+    guide.dwellPhase = "";
+    clearInterval(dwellTimer);
+    dwellTimer = 0;
+    return;
+  }
+  if (!guide.dwellAt || guide.dwellPhase !== s.phase + (guide.limb || "")) {
+    guide.dwellAt = performance.now();
+    guide.dwellPhase = s.phase + (guide.limb || "");
+  }
+  if (!dwellTimer) {
+    dwellTimer = setInterval(() => {
+      const warn = document.getElementById("dwell");
+      if (!warn || !guide?.dwellAt) return;
+      warn.hidden = performance.now() - guide.dwellAt < 8000;
+    }, 400);
+  }
+}
+
+function applySkip() {
+  for (const step of SKIP_ACTIONS) caseState = act(caseState, step);
+  guide.limb = null;
+  noteStamps();
+  fillGuide();
+}
+
 
 function renderExplore(main) {
   if (main.dataset.view !== "explore") {
@@ -481,7 +646,9 @@ function resetPrediction() {
 
 function openCase(id) {
   if (route.view === "case" && route.id === id) {
-    caseState = startCase(id);
+    beginCase(id);
+    const main = document.getElementById("main");
+    if (main) main.dataset.view = "";
     paint();
     window.scrollTo(0, 0);
     return;
@@ -490,13 +657,14 @@ function openCase(id) {
 }
 
 function onClick(event) {
-  const el = event.target.closest("[data-act],[data-open],[data-rhythm],[data-pea],[data-move],[data-drug],[data-predict],[data-cause-pick]");
+  const el = event.target.closest("[data-act],[data-open],[data-rhythm],[data-pea],[data-move],[data-drug],[data-predict],[data-cause-pick],[data-stage]");
   if (!el || el.disabled) return;
   if (el.dataset.act === "theme") {
     const next = themeNow() === "dark" ? "light" : "dark";
     document.documentElement.setAttribute("data-theme", next);
     localStorage.setItem("als-theme", next);
     chrome();
+    if (route.view === "case") fillGuide();
     return;
   }
   if (el.dataset.act === "clear") {
@@ -565,13 +733,35 @@ function onClick(event) {
     togglePlay();
     return;
   }
-  if (route.view === "case" && caseState && el.dataset.act && !caseState.ended) {
-    const action = { type: el.dataset.act };
-    if (el.dataset.cause) action.cause = el.dataset.cause;
-    if (el.dataset.item) action.item = el.dataset.item;
-    caseState = act(caseState, action);
-    fillCase();
+  if (route.view === "case" && caseState && el.dataset.stage) {
+    const id = el.dataset.stage;
+    const status = stageStatus(caseState);
+    if (caseState.ended || (status.done[id] && id !== status.current)) {
+      guide.review = guide.review === id ? null : id;
+      fillGuide();
+    }
     return;
+  }
+  if (route.view === "case" && caseState && el.dataset.act) {
+    const type = el.dataset.act;
+    if (type === "drawer") { guide.drawer = true; fillGuide(); return; }
+    if (type === "close-drawer") { guide.drawer = false; fillGuide(); return; }
+    if (type === "limb-yes") { guide.limb = "shock"; guide.dwellAt = performance.now(); fillGuide(); return; }
+    if (type === "limb-no") { guide.limb = "no"; guide.dwellAt = performance.now(); fillGuide(); return; }
+    if (type === "limb-back") { guide.limb = null; fillGuide(); return; }
+    if (type === "dismiss-finding") { guide.seenFindings = caseState.findings.length; fillGuide(); return; }
+    if (type === "skip-airway") { guide.skipAirway = true; fillGuide(); return; }
+    if (type === "skip-capno") { guide.skipCapno = true; fillGuide(); return; }
+    if (type === "close-review") { guide.review = null; fillGuide(); return; }
+    if (type === "skip-intro") { applySkip(); return; }
+    if (caseState.ended) return;
+    const before = caseState.log.length;
+    caseState = act(caseState, { type, cause: el.dataset.cause, item: el.dataset.item });
+    if (caseState.phase !== "decision") guide.limb = null;
+    if (caseState.log.length !== before) guide.drawer = false;
+    guide.review = null;
+    noteStamps();
+    fillGuide();
   }
 }
 
@@ -621,7 +811,7 @@ function syncRoute() {
       location.hash = "cases";
       return;
     }
-    if (!caseState || caseState.caseId !== route.id) caseState = startCase(route.id);
+    if (!caseState || caseState.caseId !== route.id) beginCase(route.id);
   }
   paint();
 }
@@ -649,6 +839,24 @@ document.getElementById("app").addEventListener("click", (event) => {
   onClick(event);
 });
 document.getElementById("app").addEventListener("input", onInput);
+document.getElementById("app").addEventListener("change", (event) => {
+  if (event.target.dataset.act !== "skip-pref") return;
+  try { localStorage.setItem("als-skip-intro", event.target.checked ? "1" : "0"); } catch { /* private mode */ }
+});
+
+let swipeY = null;
+document.getElementById("app").addEventListener("pointerdown", (event) => {
+  if (event.target.closest(".drawer-tab, .sheet-grab")) swipeY = event.clientY;
+});
+document.getElementById("app").addEventListener("pointerup", (event) => {
+  if (swipeY == null || route.view !== "case" || !guide) return;
+  const delta = event.clientY - swipeY;
+  swipeY = null;
+  if (delta < -36) guide.drawer = true;
+  else if (delta > 36) guide.drawer = false;
+  else return;
+  fillGuide();
+});
 
 if ("serviceWorker" in navigator) {
   navigator.serviceWorker.register("./sw.js").catch(() => {});

@@ -14,7 +14,7 @@ python3 -m http.server 4173
 
 Then visit `http://localhost:4173`.
 
-- **Cases** — ten arrests. Every action moves the clock. Score and debrief at the end. Best scores stay in `localStorage` on the device.
+- **Cases** — ten arrests, one step at a time. Before the defibrillator is attached the screen is a single prompt. After that the monitor stays up and the next step sits beside it. The 4Hs and 4Ts open from a drawer. Score and debrief at the end. Best scores stay in `localStorage` on the device. Experienced users can start with the defibrillator already on.
 - **Explore** — pick a rhythm and a cycle, read the algorithm path, and turn on **Predict first** to commit before the answer is shown.
 - **About** — what the model simulates, and what it refuses to invent.
 
