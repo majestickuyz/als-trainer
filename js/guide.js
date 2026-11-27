@@ -1,5 +1,5 @@
 import { getCase } from "./cases.js";
-import { isAdrenalineDue, isAmioDue } from "./engine.js";
+import { formatClock, isAdrenalineDue, isAmioDue } from "./engine.js";
 
 export const STAGES = [
   { id: "recognise", label: "Recognise", short: "See" },
@@ -96,6 +96,11 @@ export function currentCard(s, ui = {}) {
     };
   }
 
+  if (!ui.expert && ui.flow) {
+    const sequenced = sequenceCard(s, ui);
+    if (sequenced) return sequenced;
+  }
+
   if (!s.safety) {
     return {
       id: "recognise",
@@ -180,6 +185,9 @@ export function currentCard(s, ui = {}) {
     const limb = ui.limb || null;
     const name = s.rhythm === "vf" ? "VF" : s.rhythm === "pvt" ? "Pulseless VT" : s.rhythm === "pea" ? "PEA" : "Asystole";
     if (limb === "shock") {
+      if (!ui.expert && (s.rhythm === "vf" || s.rhythm === "pvt")) {
+        return shockSequenceCard(s, ui.flow?.step || "charge");
+      }
       return {
         id: "charge",
         stage: "rhythm",
@@ -227,9 +235,9 @@ export function currentCard(s, ui = {}) {
     if (s.cycleEndsAt != null && s.t >= s.cycleEndsAt - 0.5) {
       return assessCard("Two minutes are up.", s);
     }
-    if (!s.access) return accessCard();
+    if (!s.access) return accessCard(!!ui.expert);
     if (isAdrenalineDue(s) || isAmioDue(s)) return drugCard(s);
-    if (!s.airway && !ui.skipAirway) return airwayCard();
+    if (!s.airway && !ui.skipAirway) return ui.expert ? airwayCard() : basicAirwayCard(s);
     if (s.airway && !s.capno && !ui.skipCapno) return capnoCard();
     return cycleCard(s);
   }
@@ -250,7 +258,21 @@ function assessCard(body, s) {
   };
 }
 
-function accessCard() {
+function accessCard(expert) {
+  if (!expert) {
+    return {
+      id: "access",
+      stage: "treat",
+      kicker: "Access",
+      title: "Vascular access (IV or IO).",
+      body: "Early IV access. IO if IV is not possible. Chest compressions keep going.",
+      targets: [
+        { label: "Choose IV", act: "access-iv", tone: "primary" },
+        { label: "Choose IO — IV is not possible", act: "access-io", tone: "ghost" },
+        { label: "Keep CPR going", act: "cpr-30", tone: "ghost" },
+      ],
+    };
+  }
   return {
     id: "access",
     stage: "treat",
@@ -265,6 +287,21 @@ function accessCard() {
   };
 }
 
+function basicAirwayCard(s) {
+  const targets = [];
+  if (!s.oxygen) targets.push({ label: "Give oxygen", act: "oxygen", tone: "primary" });
+  targets.push({ label: "30:2 in progress", act: "airway-basic", tone: s.oxygen ? "primary" : "ghost" });
+  targets.push({ label: "Later — keep 30:2", act: "skip-airway", tone: "ghost" });
+  return {
+    id: "airway-basic",
+    stage: "treat",
+    kicker: "Airway",
+    title: "Basic airway.",
+    body: "Ensure high-quality chest compressions and minimise interruptions. Give oxygen. Ventilate 30:2 until an advanced airway is in.",
+    targets: targets.slice(0, 3),
+  };
+}
+
 function drugCard(s) {
   const targets = [];
   if (isAdrenalineDue(s)) {
@@ -275,7 +312,7 @@ function drugCard(s) {
     });
   }
   if (isAmioDue(s)) {
-    targets.push({ label: "Amiodarone 300 mg", act: "amiodarone", tone: "primary" });
+    targets.push({ label: nextAmioLabel(s), act: "amiodarone", tone: "primary" });
   }
   targets.push({ label: "Keep compressions going", act: "cpr-30", tone: "ghost" });
   const which = [
@@ -403,4 +440,220 @@ export function drawerModel(s) {
     ],
     causes: causes.map(([id, label]) => ({ id, label, act: "treat", done: !!s.treatMarks[id] })),
   };
+}
+
+function nextAmioLabel(s) {
+  return s.amio >= 1 ? "Further amiodarone 150 mg" : "Amiodarone 300 mg";
+}
+
+function sequenceCard(s, ui) {
+  const flow = ui.flow;
+  if (!flow) return null;
+  if (flow.kind === "shock") return shockSequenceCard(s, flow.step || "charge");
+  if (flow.kind === "drug") return drugSequenceCard(s, flow);
+  if (flow.kind === "access") return accessConfirmCard(flow);
+  if (flow.kind === "airway") return advancedAirwayCard();
+  if (flow.kind === "capno") return flow.step === "seen" ? capnoSeenCard() : capnoAttachCard();
+  return null;
+}
+
+function shockSequenceCard(s, step) {
+  const shockable = s.rhythm === "vf" || s.rhythm === "pvt" || s.phase === "postshock";
+  if (!shockable && step !== "resume") return null;
+  if (step === "oxygen") {
+    return {
+      id: "shock-oxygen",
+      stage: "rhythm",
+      kicker: "Shock",
+      title: "Oxygen away.",
+      body: "Move oxygen clear of the chest. Compressions continue until everyone is clear.",
+      targets: [
+        { label: "Oxygen is clear", act: "shock-advance", tone: "primary" },
+        { label: "Shock without moving oxygen", act: "shock-skip", tone: "shock" },
+      ],
+    };
+  }
+  if (step === "clear") {
+    return {
+      id: "shock-clear",
+      stage: "rhythm",
+      kicker: "Shock",
+      title: "Stand clear.",
+      body: "All clear? Hands off for the shock only, then straight back on the chest.",
+      targets: [
+        { label: "All clear", act: "shock-advance", tone: "primary" },
+        { label: "Shock without an all-clear", act: "shock-skip", tone: "shock" },
+      ],
+    };
+  }
+  if (step === "deliver") {
+    return {
+      id: "shock-deliver",
+      stage: "rhythm",
+      kicker: "Shock",
+      title: "Deliver the shock.",
+      body: "One shock. Minimise the hands-off time.",
+      targets: [{ label: "Deliver one shock", act: "shock", tone: "shock" }],
+    };
+  }
+  if (step === "resume") {
+    return {
+      id: "shock-resume",
+      stage: "rhythm",
+      kicker: "Shock",
+      title: "Resume CPR immediately.",
+      body: "Do not pause to look. Two minutes of CPR, then reassess.",
+      targets: [{ label: "Resume CPR now", act: "cpr", tone: "primary" }],
+    };
+  }
+  return {
+    id: "shock-charge",
+    stage: "rhythm",
+    kicker: "Shock",
+    title: "Charge.",
+    body: "CPR continues while the defibrillator charges. Do not stop compressions to charge.",
+    targets: [
+      { label: "Charged — CPR still going", act: "shock-advance", tone: "primary" },
+      { label: "Shock now, skip the checks", act: "shock-skip", tone: "shock" },
+    ],
+  };
+}
+
+function drugSequenceCard(s, flow) {
+  const drug = flow.drug || flow.prompted || "adrenaline";
+  const amioLabel = nextAmioLabel(s);
+  if (flow.step === "route") {
+    if (!s.access) {
+      return {
+        id: "drug-route-none",
+        stage: "treat",
+        kicker: "Route",
+        title: "No line yet.",
+        body: "Vascular access (IV or IO) before the drug. Early IV. IO if IV is not possible.",
+        targets: [
+          { label: "IV access", act: "iv", tone: "primary" },
+          { label: "IO access", act: "io", tone: "ghost" },
+        ],
+      };
+    }
+    const have = s.access === "io" ? "IO" : "IV";
+    return {
+      id: "drug-route",
+      stage: "treat",
+      kicker: "Route",
+      title: "Confirm the route.",
+      body: `Access in place is ${have}. The algorithm asks for IV, or IO if IV is not possible.`,
+      targets: [
+        { label: `Confirm ${have}`, act: "drug-route", route: s.access, tone: "primary" },
+        { label: s.access === "iv" ? "Say IO anyway" : "Say IV anyway", act: "drug-route", route: s.access === "iv" ? "io" : "iv", tone: "ghost" },
+      ],
+    };
+  }
+  if (flow.step === "give") {
+    const label = drug === "amiodarone" ? `Give ${amioLabel.replace("Further ", "further ")}` : "Give adrenaline 1 mg";
+    return {
+      id: "drug-give",
+      stage: "treat",
+      kicker: "Give",
+      title: "Give it during compressions.",
+      body: "Do not stop CPR for the drug. The dose is the RCUK 2025 guideline text. The card states the timing.",
+      targets: [{ label, act: drug, tone: "primary" }],
+    };
+  }
+  if (flow.step === "flush") {
+    return {
+      id: "drug-flush",
+      stage: "treat",
+      kicker: "Flush",
+      title: "Flush.",
+      body: "Flush the line after the drug. The algorithm card does not state a flush volume.",
+      targets: [{ label: "Flushed", act: "drug-flush", tone: "primary" }],
+    };
+  }
+  if (flow.step === "record") {
+    const times = drug === "amiodarone" ? s.amioAt : s.adrenalineAt;
+    const at = times.length ? times[times.length - 1] : s.t;
+    return {
+      id: "drug-record",
+      stage: "treat",
+      kicker: "Time",
+      title: "Record the time.",
+      body: `Given at ${formatClock(at)}. That is the clock for the next 3–5 minutes.`,
+      targets: [{ label: "Time recorded", act: "drug-record", tone: "primary" }],
+    };
+  }
+  return {
+    id: "drug-select",
+    stage: "treat",
+    kicker: "Drug",
+    title: "Select the drug and dose.",
+    body: "Adrenaline 1 mg. Amiodarone 300 mg after 3 shocks, and a further 150 mg after 5 shocks in the guideline text. Nothing else is added here.",
+    nudge: true,
+    targets: [
+      { label: "Adrenaline 1 mg", act: "drug-pick", drug: "adrenaline", tone: drug === "adrenaline" ? "primary" : "ghost" },
+      { label: amioLabel, act: "drug-pick", drug: "amiodarone", tone: drug === "amiodarone" ? "primary" : "ghost" },
+    ],
+  };
+}
+
+function accessConfirmCard(flow) {
+  const route = flow.route === "io" ? "IO" : "IV";
+  return {
+    id: "access-confirm",
+    stage: "treat",
+    kicker: "Access",
+    title: `Confirm ${route}.`,
+    body: route === "IV"
+      ? "Early IV access. Say if the line is in."
+      : "IO because IV is not possible. Say if the line is in.",
+    targets: [
+      { label: `${route} is in`, act: "access-confirm", tone: "primary" },
+      { label: route === "IV" ? "Use IO instead" : "Try IV instead", act: route === "IV" ? "access-io" : "access-iv", tone: "ghost" },
+    ],
+  };
+}
+
+function advancedAirwayCard() {
+  return {
+    id: "airway-advanced",
+    stage: "treat",
+    kicker: "Airway",
+    title: "Consider an advanced airway.",
+    body: "When you are skilled: a supraglottic airway or a tracheal tube. Then use waveform capnography. Compressions become continuous.",
+    targets: [
+      { label: "Supraglottic airway", act: "sga", tone: "primary" },
+      { label: "Tracheal tube", act: "ett", tone: "ghost" },
+      { label: "Later — keep 30:2", act: "skip-airway", tone: "ghost" },
+    ],
+  };
+}
+
+function capnoAttachCard() {
+  return {
+    id: "capno-attach",
+    stage: "treat",
+    kicker: "Capnography",
+    title: "Use waveform capnography.",
+    body: "Attach it now the advanced airway is in. End-tidal CO2 then shows on the monitor.",
+    targets: [
+      { label: "Attach waveform capnography", act: "capno", tone: "primary" },
+      { label: "Later", act: "skip-capno", tone: "ghost" },
+    ],
+  };
+}
+
+function capnoSeenCard() {
+  return {
+    id: "capno-seen",
+    stage: "treat",
+    kicker: "Capnography",
+    title: "EtCO2 is on the monitor.",
+    body: "Use the waveform. A rise can be the first sign of ROSC.",
+    targets: [{ label: "Seen", act: "capno-seen", tone: "primary" }],
+  };
+}
+
+export function addNote(ui, s, text, stage) {
+  if (!ui.notes) ui.notes = [];
+  ui.notes.push({ t: s.t, text, stage });
 }

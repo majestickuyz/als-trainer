@@ -2,7 +2,7 @@ import { CASES, getCase, nextCaseId, randomCaseId } from "./cases.js";
 import { CAUSES } from "./causes.js";
 import { DOSE_NOTE, MOVES, RHYTHMS, activeNodes, drugPlan, predictionCorrect } from "./explore-model.js";
 import { act, etco2, formatClock, readout, startCase } from "./engine.js";
-import { SKIP_ACTIONS, STAGES, currentCard, drawerModel, splitScreen, stageLog, stageStatus, stageVerdict } from "./guide.js";
+import { SKIP_ACTIONS, STAGES, addNote, currentCard, drawerModel, splitScreen, stageLog, stageStatus, stageVerdict } from "./guide.js";
 import { mountTrace, rhythmMeta } from "./rhythm.js";
 import { clearRecord, loadRecord, saveResult, shiftStats } from "./store.js";
 
@@ -102,7 +102,27 @@ function stopPlay() {
 }
 
 function freshGuide() {
-  return { limb: null, seenFindings: 0, review: null, drawer: false, dwellAt: 0, dwellPhase: "", nudged: "", cardId: "", skipAirway: false, skipCapno: false, stamps: {} };
+  return {
+    limb: null,
+    seenFindings: 0,
+    review: null,
+    drawer: false,
+    dwellAt: 0,
+    dwellPhase: "",
+    nudged: "",
+    cardId: "",
+    skipAirway: false,
+    skipCapno: false,
+    stamps: {},
+    expert: !stepModeOn(),
+    flow: null,
+    notes: [],
+    shockArmedAt: 0,
+  };
+}
+
+function stepModeOn() {
+  try { return localStorage.getItem("als-step-mode") !== "0"; } catch { return true; }
 }
 
 function skipPref() {
@@ -188,6 +208,7 @@ function casesView() {
         <h2>Run the arrest.</h2>
         <p class="small">Ten patients. The cause is hidden until the debrief. Each case is one step at a time until the defibrillator is on.</p>
         <label class="skip-pref"><input type="checkbox" data-act="skip-pref" ${skipPref() ? "checked" : ""}> Experienced: start with the defibrillator on</label>
+        <label class="skip-pref"><input type="checkbox" data-act="step-pref" ${stepModeOn() ? "checked" : ""}> Step-by-step shock, drugs and airway</label>
         <button type="button" class="primary" data-act="random" style="margin:10px 0">Random case</button>
         <div class="case-list">${rows}</div>
       </section>
@@ -210,6 +231,7 @@ function renderCase(main) {
         <div class="rail" id="rail" role="tablist" aria-label="Arrest stages"></div>
         <div class="rail-end">
           <span class="mono rail-clock" id="rail-clock">0:00</span>
+          <button type="button" class="texty" data-act="toggle-steps">Steps</button>
           <button type="button" class="texty" data-act="theme">Dark</button>
           <a class="texty" href="#cases">Exit</a>
         </div>
@@ -275,6 +297,8 @@ function fillGuide() {
   document.getElementById("rail-clock").textContent = formatClock(s.t);
   const theme = document.querySelector(".rail-end [data-act=theme]");
   if (theme) theme.textContent = themeNow() === "dark" ? "Light" : "Dark";
+  const stepsBtn = document.querySelector(".rail-end [data-act=toggle-steps]");
+  if (stepsBtn) stepsBtn.textContent = guide.expert ? "Expert" : "Steps";
 
   const crit = document.getElementById("guide-crit");
   if (s.criticals.length && !s.ended) {
@@ -339,7 +363,12 @@ function stepHtml(s) {
   const dwell = `<p id="dwell" class="dwell" hidden>Minimise the interruption. Deliver the shock, or restart CPR.</p>`;
   const flash = s.flash ? `<p class="flash ${esc(s.flash.kind)}" role="status">${esc(s.flash.text)}</p>` : "";
   const targets = card.targets.map((target) => {
-    const extra = target.item ? ` data-item="${esc(target.item)}"` : target.cause ? ` data-cause="${esc(target.cause)}"` : "";
+    const extra = [
+    target.item ? ` data-item="${esc(target.item)}"` : "",
+    target.cause ? ` data-cause="${esc(target.cause)}"` : "",
+    target.drug ? ` data-drug="${esc(target.drug)}"` : "",
+    target.route ? ` data-route="${esc(target.route)}"` : "",
+  ].join("");
     return `<button type="button" class="tap ${esc(target.tone || "ghost")}" data-act="${esc(target.act)}"${extra}>${esc(target.label)}</button>`;
   }).join("");
   return `<article class="step-card${card.nudge ? " nudge" : ""}" data-step="${esc(card.id)}">
@@ -356,8 +385,10 @@ function reviewHtml(s, stageId, debrief) {
   const stage = STAGES.find((item) => item.id === stageId) || STAGES[0];
   const verdict = stageVerdict(s, stageId);
   const lines = stageLog(s, stageId, guide.stamps);
-  const list = lines.length
-    ? `<ol class="timeline">${lines.map((line) => `<li><span class="when mono">${esc(formatClock(line.t))}</span><span class="${esc(line.tone)}">${esc(line.text)}</span></li>`).join("")}</ol>`
+  const noted = (guide.notes || []).filter((note) => note.stage === stageId).map((note) => ({ t: note.t, tone: "info", text: note.text }));
+  const merged = [...lines, ...noted].sort((a, b) => a.t - b.t);
+  const list = merged.length
+    ? `<ol class="timeline">${merged.map((line) => `<li><span class="when mono">${esc(formatClock(line.t))}</span><span class="${esc(line.tone)}">${esc(line.text)}</span></li>`).join("")}</ol>`
     : `<p class="small">Nothing recorded on this stage.</p>`;
   return `<article class="step-card review-card">
     <p class="kicker">${debrief ? "Debrief" : "Read only"} · ${esc(stage.label)}</p>
@@ -391,6 +422,7 @@ function debriefHtml(s) {
         <a class="texty" href="#cases">All cases</a>
       </div>
     </section>
+    ${(guide.notes || []).length ? `<section class="card"><p class="kicker">Step sequence</p><ul class="deductions">${guide.notes.map((note) => `<li><span class="mono">${esc(formatClock(note.t))}</span> ${esc(note.text)}</li>`).join("")}</ul></section>` : ""}
     ${reviewHtml(s, focus, true)}
     <section class="card">
       <p class="kicker">From this case</p>
@@ -487,8 +519,10 @@ function exploreSpec() {
 }
 
 function fillExplore() {
+  const hr = document.getElementById("ex-hr");
+  if (!hr) return;
   const meta = rhythmMeta(explore.rhythm === "pea" ? "pea" : explore.rhythm, explore.peaStyle);
-  document.getElementById("ex-hr").textContent = `${meta.name} · ${meta.hr}`;
+  hr.textContent = `${meta.name} · ${meta.hr}`;
   document.getElementById("ex-cap").textContent = meta.detail;
   document.getElementById("ex-trace").setAttribute("aria-label", `Synthetic ${meta.detail}`);
   document.getElementById("ex-rhythms").innerHTML = RHYTHMS.map((r) => `<button type="button" data-rhythm="${r.id}" aria-pressed="${explore.rhythm === r.id}">${esc(r.label)}</button>`).join("");
@@ -708,7 +742,7 @@ function onClick(event) {
     fillExplore();
     return;
   }
-  if (el.dataset.drug) {
+  if (route.view === "explore" && el.dataset.drug) {
     explore.drugTouched = true;
     if (el.dataset.drug === "none") explore.drugs = [];
     else {
@@ -746,19 +780,148 @@ function onClick(event) {
     const type = el.dataset.act;
     if (type === "drawer") { guide.drawer = true; fillGuide(); return; }
     if (type === "close-drawer") { guide.drawer = false; fillGuide(); return; }
-    if (type === "limb-yes") { guide.limb = "shock"; guide.dwellAt = performance.now(); fillGuide(); return; }
-    if (type === "limb-no") { guide.limb = "no"; guide.dwellAt = performance.now(); fillGuide(); return; }
-    if (type === "limb-back") { guide.limb = null; fillGuide(); return; }
+    if (type === "limb-yes") {
+      guide.limb = "shock";
+      guide.dwellAt = performance.now();
+      if (!guide.expert && (caseState.rhythm === "vf" || caseState.rhythm === "pvt")) {
+        guide.flow = { kind: "shock", step: "charge" };
+      }
+      fillGuide();
+      return;
+    }
+    if (type === "limb-no") { guide.limb = "no"; guide.flow = null; guide.dwellAt = performance.now(); fillGuide(); return; }
+    if (type === "limb-back") { guide.limb = null; guide.flow = null; fillGuide(); return; }
+    if (type === "toggle-steps") {
+      guide.expert = !guide.expert;
+      guide.flow = null;
+      try { localStorage.setItem("als-step-mode", guide.expert ? "0" : "1"); } catch { /* private mode */ }
+      fillGuide();
+      return;
+    }
+    if (type === "shock-advance" && guide.flow?.kind === "shock") {
+      const step = guide.flow.step || "charge";
+      const done = { charge: "Charged while CPR continued.", oxygen: "Oxygen moved away from the chest.", clear: "All clear checked before the shock." };
+      if (done[step]) addNote(guide, caseState, done[step], "rhythm");
+      guide.flow.step = { charge: "oxygen", oxygen: "clear", clear: "deliver" }[step] || "deliver";
+      fillGuide();
+      return;
+    }
+    if (type === "shock-skip" && guide.flow?.kind === "shock") {
+      const step = guide.flow.step || "charge";
+      const missed = {
+        charge: "Shock delivered without moving oxygen clear or an all-clear check.",
+        oxygen: "Shock delivered before the all-clear check.",
+        clear: "Shock delivered without confirming all clear.",
+      };
+      addNote(guide, caseState, missed[step] || "Shock sequence shortened.", "rhythm");
+      caseState = act(caseState, { type: "shock" });
+      guide.flow.step = "resume";
+      guide.shockArmedAt = performance.now();
+      guide.limb = null;
+      noteStamps();
+      fillGuide();
+      return;
+    }
+    if (type === "drug-pick" && guide.flow?.kind === "drug") {
+      const picked = el.dataset.drug || guide.flow.drug;
+      if (picked && guide.flow.prompted && picked !== guide.flow.prompted) {
+        addNote(guide, caseState, "A different drug was selected from the one this cycle prompted.", "treat");
+      }
+      guide.flow.drug = picked;
+      guide.flow.step = "route";
+      addNote(guide, caseState, picked === "amiodarone" ? "Amiodarone dose selected." : "Adrenaline 1 mg selected.", "treat");
+      fillGuide();
+      return;
+    }
+    if (type === "drug-route" && guide.flow?.kind === "drug") {
+      const route = el.dataset.route;
+      if (caseState.access && route && route !== caseState.access) {
+        addNote(guide, caseState, "The route named did not match the access already in place. The drug still uses the line that is in.", "treat");
+      } else if (caseState.access) {
+        addNote(guide, caseState, `Route confirmed: ${caseState.access === "io" ? "IO" : "IV"}.`, "treat");
+      }
+      guide.flow.step = "give";
+      fillGuide();
+      return;
+    }
+    if (type === "drug-flush" && guide.flow?.kind === "drug") {
+      addNote(guide, caseState, "Line flushed. The algorithm card does not state a flush volume.", "treat");
+      guide.flow.step = "record";
+      fillGuide();
+      return;
+    }
+    if (type === "drug-record" && guide.flow?.kind === "drug") {
+      addNote(guide, caseState, "Dose time recorded.", "treat");
+      guide.flow = null;
+      fillGuide();
+      return;
+    }
+    if (type === "access-iv" || type === "access-io") {
+      guide.flow = { kind: "access", route: type === "access-io" ? "io" : "iv" };
+      fillGuide();
+      return;
+    }
+    if (type === "access-confirm" && guide.flow?.kind === "access") {
+      const route = guide.flow.route === "io" ? "io" : "iv";
+      caseState = act(caseState, { type: route });
+      if (caseState.access) {
+        addNote(guide, caseState, `${route === "io" ? "IO" : "IV"} access confirmed.`, "treat");
+        guide.flow = null;
+      }
+      noteStamps();
+      fillGuide();
+      return;
+    }
+    if (type === "airway-basic") {
+      addNote(guide, caseState, "Basic airway: oxygen and 30:2, with compressions continuing.", "treat");
+      guide.flow = { kind: "airway", step: "advanced" };
+      fillGuide();
+      return;
+    }
+    if (type === "capno-seen") {
+      guide.flow = null;
+      fillGuide();
+      return;
+    }
     if (type === "dismiss-finding") { guide.seenFindings = caseState.findings.length; fillGuide(); return; }
-    if (type === "skip-airway") { guide.skipAirway = true; fillGuide(); return; }
-    if (type === "skip-capno") { guide.skipCapno = true; fillGuide(); return; }
+    if (type === "skip-airway") { guide.skipAirway = true; if (guide.flow?.kind === "airway") guide.flow = null; fillGuide(); return; }
+    if (type === "skip-capno") { guide.skipCapno = true; if (guide.flow?.kind === "capno") guide.flow = null; fillGuide(); return; }
     if (type === "close-review") { guide.review = null; fillGuide(); return; }
     if (type === "skip-intro") { applySkip(); return; }
+    if ((type === "adrenaline" || type === "amiodarone") && !guide.expert && guide.flow?.step !== "give") {
+      guide.flow = { kind: "drug", step: "select", drug: type, prompted: type };
+      guide.drawer = false;
+      fillGuide();
+      return;
+    }
     if (caseState.ended) return;
     const before = caseState.log.length;
     caseState = act(caseState, { type, cause: el.dataset.cause, item: el.dataset.item });
     if (caseState.phase !== "decision") guide.limb = null;
     if (caseState.log.length !== before) guide.drawer = false;
+    if (type === "shock" && guide.flow?.kind === "shock" && caseState.phase === "postshock") {
+      if (guide.flow.step === "deliver") addNote(guide, caseState, "Shock delivered after charge, oxygen clear, and all clear.", "rhythm");
+      guide.flow.step = "resume";
+      guide.shockArmedAt = performance.now();
+    }
+    if (type === "cpr" && guide.flow?.kind === "shock") {
+      const slow = guide.shockArmedAt && performance.now() - guide.shockArmedAt > 8000;
+      addNote(guide, caseState, slow ? "CPR was not restarted straight away after the shock." : "CPR restarted immediately after the shock.", "rhythm");
+      guide.flow = null;
+      guide.shockArmedAt = 0;
+    }
+    if ((type === "adrenaline" || type === "amiodarone") && guide.flow?.kind === "drug" && guide.flow.step === "give" && caseState.log.length !== before) {
+      addNote(guide, caseState, type === "adrenaline" ? "Adrenaline 1 mg given." : "Amiodarone given.", "treat");
+      guide.flow.step = "flush";
+    }
+    if ((type === "sga" || type === "ett") && caseState.airway && !guide.expert && !caseState.capno && !guide.skipCapno) {
+      addNote(guide, caseState, "Advanced airway placed.", "treat");
+      guide.flow = { kind: "capno", step: "attach" };
+    }
+    if (type === "capno" && caseState.capno && guide.flow?.kind === "capno") {
+      addNote(guide, caseState, "Waveform capnography on. EtCO2 shows on the monitor.", "treat");
+      guide.flow.step = "seen";
+    }
     guide.review = null;
     noteStamps();
     fillGuide();
@@ -840,8 +1003,12 @@ document.getElementById("app").addEventListener("click", (event) => {
 });
 document.getElementById("app").addEventListener("input", onInput);
 document.getElementById("app").addEventListener("change", (event) => {
-  if (event.target.dataset.act !== "skip-pref") return;
-  try { localStorage.setItem("als-skip-intro", event.target.checked ? "1" : "0"); } catch { /* private mode */ }
+  if (event.target.dataset.act === "skip-pref") {
+    try { localStorage.setItem("als-skip-intro", event.target.checked ? "1" : "0"); } catch { /* private mode */ }
+  }
+  if (event.target.dataset.act === "step-pref") {
+    try { localStorage.setItem("als-step-mode", event.target.checked ? "1" : "0"); } catch { /* private mode */ }
+  }
 });
 
 let swipeY = null;
